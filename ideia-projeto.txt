@@ -1,0 +1,18 @@
+- Registrar peers URI etc no serviço de nomes
+- Iniciar a eleição:
+   - usar timeout aleatorio (não recebeu heartbeat depois desse tempo = eleicao)
+   - primeiro peer que perceber se elege e manda request_vote para os outros peers
+   - se tiver maioria (no inicio > 3) vira tracker become_tracker
+   - caso nao receba 5 votos, total_peers -- e assim por em diante
+   - incrementa epoca
+
+- Tracker:
+ - peers atualizam o tracker o registro de arquivos
+ - envia heartbeat send_heartbeat com frequencia para nao dar timeout e iniciar outra eleicao
+ - no heartbeat, envia a sua epoca_atual
+ - ao ser acessado, mostra a lista com os arquivos e com qual peer eles estão 
+
+- Recebe heartbeat:
+  - checa de tempos em tempo, se passa do timeout, chama start_election
+  - checa se sua epoca está igual a atual, caso seja menor, tem um novo tracker e 
+  deve enviar seu registro de arquivos

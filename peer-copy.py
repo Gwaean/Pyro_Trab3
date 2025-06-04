@@ -22,7 +22,7 @@ class Peer:
         self.file_registry = {}
         self.stop_threads = False
         self.setup_shared_directory()
-        self.update_file_list()  # Ensure the file list is updated before notifying the tracker.
+        self.update_local_file_list()  # Ensure the file list is updated before notifying the tracker.
         self.voted_for = None
         self.received_votes = 0
         self.election_in_progress = threading.Lock() 
@@ -75,49 +75,67 @@ class Peer:
         """Returns the number of name registrations."""
         return len(self.storage)
     
+    def select_initial_tracker(self):
+     if self.peer_id == 1:
+      print(f"Peer {self.peer_id} é o tracker inicial")
+      self.epoca = 0
+      self.is_tracker = True
+      self.current_tracker_uri = self.get_peer_uri()
+      self.update_file_registry(self.peer_id, self.files)
+      self.start_heartbeat()
+     else:
+         try:
+              with Pyro5.api.locate_ns() as ns:
+                 self.current_tracker_uri = ns.lookup("Peer_1")
+                 print("Conectado ao tracker inicial")
+                 self.notify_tracker_files()
+         except Exception:
+            print("Tracker nao encontrado, iniciando eleição")
+            self.start_election(5)  # Inicia a eleição com 5 peers
+    
     @Pyro5.api.expose
     def send_heartbeat(self,epoca):
         if self.current_tracker_uri:
             try:
                 tracker = Pyro5.api.Proxy(self.current_tracker_uri)
-                return tracker.checa_heartbeat(epoca)
+                return tracker.checa_heartbeat(epoca, tracker)
             except Pyro5.errors.CommunicationError as e:
                 print(f"Peer {self.peer_id}: Erro de comunicação com o tracker (URI: {self.current_tracker_uri}) durante o envio de heartbeat: {e}")
         else:
             print(f"Peer {self.peer_id}: Tracker não definido.")
         return None
     @Pyro5.api.expose
-    def checa_heartbeat(self, epoca):
+    def checa_heartbeat(self, epoca, tracker):
         if epoca > self.epoca:
             self.epoca = epoca
-            self.notify_tracker_files()
+            # marcar que vc nao eh tracker, buscar a referencia no tracker no serv nomes, cadastrar nele os seus arquivos
+            self.is_tracker = False
+            tracker_uri = tracker.get_uri_name()
+            self.notify_tracker_files(tracker_uri)    
+           #resetar o temporizador
         self.last_heartbeat = time.time()
         if(time.time() - self.last_heartbeat > self.election_timeout):
             print(f"Peer {self.peer_id}: Timeout de eleição atingido, iniciando nova eleição.")
             self.iniciar_eleicao()
+            self.election_timeout = random.uniform(0.2, 0.6)
         else:
             return ("Heartbeat recebido com sucesso.", self.epoca)
+        
     @Pyro5.api.expose
     def iniciar_eleicao(self, total_peers):
         self.epoca += 1
-        if self.election_in_progress.locked():
-            print(f"Peer {self.peer_id}: Eleição já em andamento.")
-            return
-        with self.election_in_progress:
-            print(f"Peer {self.peer_id}: Iniciando eleição na época {self.epoca}.")
-            self.received_votes = 0
-            self.voted_for = None
-            
-            peers = self.listar_peers()
-            if not peers:
-                print(f"Peer {self.peer_id}: Nenhum peer disponível para participar da eleição.")
-                return
-            
-            for peer_uri in peers:
-                    peer = Pyro5.api.Proxy(peer_uri)
-                    if peer.request_vote(self.peer_id):
-                        self.received_votes += 1
-                        print(f"Peer {self.peer_id}: Voto recebido do peer {peer_uri}.")
+        print(f"Peer {self.peer_id}: Iniciando eleição na época {self.epoca}.")
+        self.received_votes = 1  
+        self.voted_for = self.peer_id
+        peers = self.listar_peers()
+        if not peers:
+            print(f"Peer {self.peer_id}: Nenhum peer disponível para participar da eleição.")
+            return 
+        for peer_uri in peers:
+                peer = Pyro5.api.Proxy(peer_uri)
+                if peer.request_vote(self.peer_id):
+                    self.received_votes += 1
+                    print(f"Peer {self.peer_id}: Voto recebido do peer {peer_uri}.")
              
         if( self.received_votes > total_peers // 2):
             self.become_tracker()
@@ -160,14 +178,16 @@ class Peer:
         print(f"Peer {self.peer_id}: Agora é o tracker. URI: {self.current_tracker_uri}")
         self.notify_tracker_files()
         self.send_heartbeat(self.epoca)
+   
+   
     @Pyro5.api.expose
-    def notify_tracker_files(self):
+    def local_tracker_files(self):
   
       if self.is_tracker:
         self.update_file_registry(self.peer_id, self.files)  # Notify the tracker with the updated file list.
         return True
       try:
-        self.update_file_list()
+        self.update_local_file_list()
         # Notifica o tracker atual
         tracker = Pyro5.api.Proxy(self.current_tracker_uri)
         try:
@@ -180,6 +200,17 @@ class Peer:
       except Exception as e:
         print(f"Peer {self.peer_id}: Erro ao notificar arquivos ao tracker: {e}")
         return False
+    
+    @Pyro5.api.expose
+    def notify_tracker_files(self):
+        if not self.is_tracker:
+                with Pyro5.api.locate_ns() as ns:
+                    tracker = ns.lookup(f"Tracker_Epoca_{self.epoca}")
+                    self.current_tracker_uri = tracker
+                    print(f"Peer {self.peer_id}: Tracker encontrado: {self.current_tracker_uri}")
+                
+                return tracker.update_file_registry(self.peer_id, self.files)
+        
     @Pyro5.api.expose
     def update_file_registry(self, peer_id=None, files=None):
         if peer_id and files:
@@ -207,7 +238,7 @@ class Peer:
         except Exception as e:
             print(f"Peer {self.peer_id}: Erro ao notificar arquivos ao tracker: {e}")
         return self.files
-
+    
     @Pyro5.api.expose
     def search_file(self, filename):
         if self.is_tracker:
@@ -266,7 +297,7 @@ class Peer:
                 filepath = os.path.join(self.shared_dir, filename)
                 with open(filepath, 'wb') as f:
                     f.write(file_content)
-                self.update_file_list()
+                self.update_local_file_list()
                 print(f"Arquivo {filename} baixado com sucesso do peer {source_peer_id}")
                 return True
             else:
@@ -290,13 +321,10 @@ class Peer:
         except Exception as e:
             print(f"Falha ao enviar arquivo: {e}")
             return None
-
 def main():
-
-
     if len(sys.argv) < 2:
-        print("Uso: python seu_script_peer.py <peer_id>")
-        print("Exemplo: python seu_script_peer.py 1")
+        print("Uso: python peer.py <peer_id>")
+        print("Exemplo: python peer.py 1")
         sys.exit(1)
 
     peer_id = int(sys.argv[1])
@@ -310,94 +338,75 @@ def main():
 
     peer.register_with_nameserver()
 
+
     daemon_thread = threading.Thread(target=daemon.requestLoop, daemon=True)
     daemon_thread.start()
+    time.sleep(random.uniform(0.1, 0.3))
+    
+  
 
-    peer.select_initial_tracker()
-
-    threading.Thread(target=peer.monitora_tracker_heartbeat, daemon=True).start()
-
+  
+    threading.Thread(target=lambda: peer.checa_heartbeat(peer.epoca), daemon=True).start()
+    
     print(f"Peer {peer_id} iniciado e aguardando requisições...")
-
-    time.sleep(2)
+    
+    time.sleep(2)  
     if not peer.is_tracker:
         peer.notify_tracker_files()
 
-    def menu_loop():
-        def show_menu():
-            print(f"\n--- Menu Peer {peer.peer_id} ---")
+    try:
+        while True:
+            print("\n=== Menu Peer {} ===".format(peer_id))
             print("1. Listar arquivos na rede")
             print("2. Procurar e Baixar arquivo")
             print("3. Sair")
-
-        while True:
-            show_menu()
-            escolha = input("Escolha uma opção: ")
+            
+            escolha = input("\nEscolha uma opção: ")
 
             if escolha == "1":
                 if peer.is_tracker:
-                    print("\nRegistro de arquivos do Tracker (local):")
-                    if peer.file_registry:
-                        for filename, peers_list in peer.file_registry.items():
-                            print(f"- {filename} em Peer(s): {peers_list}")
-                    else:
-                        print("Nenhum arquivo registrado ainda.")
+                    print("\nRegistro de arquivos do Tracker:")
+                    for filename, peers in peer.file_registry.items():
+                        print(f"- {filename} em Peer(s): {peers}")
                 else:
                     try:
                         registry = peer.search_file("")
-                        if isinstance(registry, dict):
-                            print("\nRegistro de arquivos na rede (do Tracker):")
-                            if registry:
-                                for filename, peers_list in registry.items():
-                                    print(f"- {filename} em Peer(s): {peers_list}")
-                            else:
-                                print("Nenhum arquivo registrado na rede.")
+                        if registry:
+                            print("\nRegistro de arquivos na rede:")
+                            for filename, peers in registry.items():
+                                print(f"- {filename} em Peer(s): {peers}")
                         else:
-                            print("Formato de resposta inesperado do tracker.")
+                            print("Nenhum arquivo registrado.")
                     except Exception as e:
-                        print(f"\nNão foi possível acessar o registro do tracker: {e}")
+                        print(f"Erro ao acessar registro: {e}")
+
             elif escolha == "2":
                 filename = input("Digite o nome do arquivo: ")
                 peers_with_file = peer.search_file(filename)
                 if peers_with_file:
                     print(f"Arquivo encontrado nos peers: {peers_with_file}")
-                    peers_to_download_from = list(peers_with_file)
-                    if peer.peer_id in peers_to_download_from:
-                        peers_to_download_from.remove(peer.peer_id)
-                        print(f"Você já possui este arquivo. Outros peers disponíveis para download: {peers_to_download_from}")
-
-                    if not peers_to_download_from:
-                        print("Você é o único peer com este arquivo ou ele não está disponível em outros peers para download.")
-                        continue
-
-                    try:
-                        source_peer_id = int(input("Digite o ID do peer de onde deseja fazer o download: "))
-                        if source_peer_id in peers_to_download_from:
-                            if peer.download_file(filename, source_peer_id):
-                                print("Download concluído com sucesso!")
-                            else:
-                                print("Falha no download")
+                    source_peer = int(input("Digite o ID do peer de onde deseja fazer o download: "))
+                    if source_peer in peers_with_file:
+                        if peer.download_file(filename, source_peer):
+                            print("✅ Download concluído!")
+                            peer.notify_tracker_files()
                         else:
-                            print("Peer ID inválido ou o peer selecionado não possui o arquivo.")
-                    except ValueError:
-                        print("Entrada inválida. Por favor, digite um número.")
+                            print("❌ Falha no download")
+                    else:
+                        print("❌ Peer ID inválido")
                 else:
-                    print(f"Arquivo '{filename}' não encontrado na rede")
-            elif escolha == "3":
-                peer.stop()
-                break
-            else:
-                print("Opção inválida. Tente novamente.")
+                    print("Arquivo não encontrado na rede")
 
-    try:
-        menu_loop()
+            elif escolha == "3":
+                print("Encerrando...")
+                break
+
     except KeyboardInterrupt:
-        print(f"\nPeer {peer.peer_id}: Interrupção pelo usuário.")
+        print("\nEncerrando peer...")
     finally:
-        peer.stop()
+        peer.stop_threads = True
         daemon.shutdown()
-        print(f"Peer {peer_id}: Daemon do Peer encerrado.")
-        os._exit(0)
+        print("Peer encerrado.")
 
 if __name__ == "__main__":
     main()
